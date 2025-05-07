@@ -1,10 +1,14 @@
+use std::fs::File;
+use std::io::BufWriter;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::thread;
+use std::thread::{self, sleep};
 use std::time::Duration;
 use std::{io::Write, sync::atomic::AtomicBool};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Client;
 use reqwest::Response;
 
 const OUT_FILE: &str = "rget.out";
@@ -13,30 +17,38 @@ const OUT_FILE: &str = "rget.out";
 #[derive(Parser, Debug)]
 #[command(name = "rget", about = "A Rust wget clone")]
 struct Args {
-    /// The URL to download
-    url: String,
-    #[arg(short, long, default_value = OUT_FILE)]
-    outfile: String,
-    #[arg(short, long)]
-    /// Whether to run the rget app interactively
-    interactive: bool,
+    #[command(subcommand)]
+    subs: SubCom,
 }
 
-struct Spinner<'a> {
+#[derive(Subcommand, Debug)]
+enum SubCom {
+    /// get an file from an url
+    Get {
+        /// The URL to download
+        url: String,
+        #[arg(short, long, default_value = OUT_FILE)]
+        outfile: String,
+    },
+    /// start the program in interactive mode
+    Interactive,
+}
+
+struct Spinner {
     chars: Vec<char>,
-    ab: &'a Arc<AtomicBool>,
+    ab: Arc<AtomicBool>,
 }
 
-impl<'a> Spinner<'a> {
-    fn new(chars: Vec<char>, ab: &'a Arc<AtomicBool>) -> Self {
+impl Spinner {
+    fn new(ab: Arc<AtomicBool>) -> Self {
+        let chars = vec!['-', '\\', '|', '/'];
         Spinner { chars, ab }
     }
 
     fn start(self) -> std::thread::JoinHandle<()> {
-        let clone = Arc::clone(self.ab);
         thread::spawn(move || {
             let mut i = 0;
-            while !clone.load(Ordering::Relaxed) {
+            while !self.ab.load(Ordering::Relaxed) {
                 print!("\r{}", self.chars[i]);
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();
                 thread::sleep(Duration::from_millis(100));
@@ -45,16 +57,31 @@ impl<'a> Spinner<'a> {
             println!("\rDone!        ");
         })
     }
+
+    fn stop(self) {
+        self.ab.store(true, Ordering::Relaxed)
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let ab = Arc::new(AtomicBool::new(false));
+    let clone = Arc::clone(&ab);
+    let sp = Spinner::new(ab);
 
-    if args.interactive {
-        return loop_download().await;
-    } else {
-        return download(args.url.as_str(), args.outfile.as_str()).await;
+    sp.start();
+    match &args.subs {
+        SubCom::Interactive => {
+            sleep(Duration::from_secs(1));
+            clone.store(true, Ordering::Relaxed);
+            return loop_download().await;
+        }
+        SubCom::Get { url, outfile } => {
+            sleep(Duration::from_secs(1));
+            clone.store(true, Ordering::Relaxed);
+            return download(url, outfile).await;
+        }
     }
 }
 
@@ -91,34 +118,31 @@ async fn loop_download() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn download(url: &str, outfile: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let ab = Arc::new(AtomicBool::new(false));
-    let chars = vec!['-', '\\', '|', '/'];
-    let s = Spinner::new(chars, &ab);
+    let mut response = Client::new().get(url).send().await?.error_for_status()?;
 
-    let join = s.start();
-    let res = reqwest::get(url).await;
-    match res {
-        Ok(r) => {
-            save_res(r, outfile).await?;
-        }
-        Err(e) => {
-            eprintln!("Error executing GET request: {}", e);
-        }
+    let total_size = response
+        .content_length()
+        .ok_or("Failed to get content length")?;
+
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{wide_bar}] {bytes}/{total_bytes} ({eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+
+    let mut dest = BufWriter::new(File::create(outfile)?);
+
+    let mut downloaded: usize = 0;
+
+    while let Some(chunk) = response.chunk().await? {
+        dest.write_all(chunk.as_ref())?;
+        downloaded += chunk.len();
+        pb.set_position(downloaded as u64);
     }
 
-    // stop the spinner
-    ab.store(true, Ordering::Relaxed);
-
-    join.join().unwrap();
-    Ok(())
-}
-
-async fn save_res(r: Response, outfile: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = r.bytes().await?;
-
-    // write the bites to the outfile
-    let mut file = std::fs::File::create(outfile)?;
-    file.write_all(&bytes)?;
-
+    pb.finish_with_message("Download complete");
     Ok(())
 }
