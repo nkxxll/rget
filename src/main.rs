@@ -1,7 +1,11 @@
 pub mod structures;
+use std::collections::VecDeque;
 use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::BufWriter;
-use std::sync::Arc;
+use std::ops::Sub;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self};
@@ -9,12 +13,15 @@ use std::time::Duration;
 use std::{io::Write, sync::atomic::AtomicBool};
 
 use clap::{Parser, Subcommand};
+use http::header::CONTENT_TYPE;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use reqwest::Response;
+use scraper::{Html, Selector};
 
 const OUT_FILE: &str = "rget.out";
 const DEFAULT_DEPTH: usize = 1;
+const MAX_THREADS: usize = 10;
 
 /// Simple program to download a URL
 #[derive(Parser, Debug)]
@@ -44,6 +51,53 @@ enum SubCom {
         #[arg(short, long, default_value_t = DEFAULT_DEPTH)]
         depth: usize,
     },
+}
+
+#[derive(Debug)]
+pub enum TextType {
+    Plain,
+    Html,
+    Css,
+    Javascript,
+    Xml,
+    Markdown,
+    Csv,
+    Richtext,
+    TabSeparatedValues,
+}
+
+#[derive(Debug)]
+pub enum ContentType {
+    Text(TextType), // For specific text formats
+    Other(String),  // For any other content type, storing the string value
+    Unknown,        // For cases where the header is missing or invalid
+}
+
+impl ContentType {
+    pub fn from_header_value(ct_value: Option<&http::HeaderValue>) -> Self {
+        match ct_value {
+            Some(value) => {
+                match value.to_str() {
+                    Ok(ct_str) => match ct_str {
+                        "text/plain" => ContentType::Text(TextType::Plain),
+                        "text/html" => ContentType::Text(TextType::Html),
+                        "text/css" => ContentType::Text(TextType::Css),
+                        "text/javascript" => ContentType::Text(TextType::Javascript),
+                        "text/xml" => ContentType::Text(TextType::Xml),
+                        "text/markdown" => ContentType::Text(TextType::Markdown),
+                        "text/csv" => ContentType::Text(TextType::Csv),
+                        "text/richtext" => ContentType::Text(TextType::Richtext),
+                        "text/tab-separated-values" => {
+                            ContentType::Text(TextType::TabSeparatedValues)
+                        }
+                        other => ContentType::Other(other.to_string()), // Store the unknown type
+                    },
+                    Err(_) => ContentType::Unknown, // Header value not valid UTF-8
+                }
+            }
+            None => ContentType::Unknown, // Header is missing
+        }
+    }
 }
 
 struct Spinner {
@@ -96,6 +150,85 @@ impl Spinner {
     }
 }
 
+struct Worker {
+    id: usize,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Worker {
+    fn new(id: usize) -> Worker {
+        let thread = thread::spawn(|| {});
+
+        Worker { id, thread }
+    }
+}
+
+struct ThreadPool {
+    workers: Vec<Worker>,
+}
+
+impl ThreadPool {
+    fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            workers.push(Worker::new(id));
+        }
+
+        ThreadPool { workers }
+    }
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Node {
+    value: String,
+    children: Vec<Self>,
+}
+
+struct Tree<'a> {
+    head: &'a Node,
+    depth: usize,
+}
+
+impl<'a> Tree<'a> {
+    fn new(h: &'a Node) -> Self {
+        Tree { head: h, depth: 1 }
+    }
+}
+
+impl Node {
+    fn new(value: String) -> Self {
+        Node {
+            value,
+            children: Vec::new(),
+        }
+    }
+    async fn traverse(&self) {
+        let mut q = VecDeque::new();
+        q.push_back(self);
+
+        while !q.is_empty() {
+            let n = q.pop_front().unwrap();
+            let value = &n.value;
+            let hash = hash_file_name(value.clone());
+            download(value, &hash).await.unwrap();
+            n.children.iter().for_each(|node| q.push_back(node));
+        }
+    }
+}
+
+fn hash_file_name(s: String) -> String {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -107,10 +240,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SubCom::Get { url, outfile } => {
             return download(url, outfile).await;
         }
-        SubCom::GetDepth { url, depth } => {
-            todo!("still needs to be implemented")
+        SubCom::GetDepth { url, depth } => download_depth(url, *depth).await,
+    }
+}
+
+async fn get_urls(n: Rc<Mutex<Node>>, max_depth: usize) {
+    let mut cur_width = 1;
+    let mut next_width = 1;
+    let mut cur_count = 1;
+    let mut cur_depth = 0;
+    let mut q = VecDeque::new();
+    q.push_back(n);
+    while !q.is_empty() && max_depth < cur_depth {
+        let current = q.pop_front().unwrap();
+        cur_count += 1;
+        let res = reqwest::get(current.lock().unwrap().value.clone())
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let content_type = ContentType::from_header_value(res.headers().get(CONTENT_TYPE));
+        match content_type {
+            ContentType::Text(_) => {
+                let site = res.text().await.unwrap();
+                let nodes = find_https_links_with_parser(&site);
+                current.lock().unwrap().children = nodes.iter().map(|x| Node::new(x.to_string())).collect();
+                for node in current.lock().unwrap().children.clone() {
+                    let push = Rc::new(Mutex::new(node));
+                    q.push_back(push);
+                }
+                next_width += current.lock().unwrap().children.len();
+                if cur_width <= cur_count {
+                    cur_depth += 1;
+                    cur_width = next_width;
+                    next_width = 0;
+                    cur_count = 0;
+                }
+            }
+            ContentType::Other(string) => {
+                println!("other content type: {string} stopping at depth {cur_depth}");
+                continue;
+            }
+            _ => unreachable!("the header should work"),
         }
     }
+}
+
+fn find_https_links_with_parser(html_content: &str) -> Vec<String> {
+    let document = Html::parse_document(html_content);
+
+    let href_selector =
+        Selector::parse("body a[href], body img[src]").expect("Failed to create selector");
+
+    let mut https_urls = Vec::new();
+
+    for element in document.select(&href_selector) {
+        // Check for the 'href' attribute first
+        if let Some(href) = element.attr("href") {
+            if href.starts_with("https://") {
+                https_urls.push(href.to_string());
+            }
+        }
+        // If no 'href', check for the 'src' attribute (for img tags)
+        else if let Some(src) = element.attr("src") {
+            if src.starts_with("https://") {
+                https_urls.push(src.to_string());
+            }
+        }
+        // Add checks for other attributes/tags as needed
+    }
+
+    https_urls
+}
+
+async fn download_depth(url: &str, depth: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let head = Node::new(url.to_string());
+    let rc_head = Rc::new(Mutex::new(head));
+    let rc_headc = Rc::clone(&rc_head);
+    get_urls(rc_head, depth).await;
+    dbg!(&rc_headc);
+    rc_headc.lock().unwrap().traverse().await;
+    Ok(())
 }
 
 async fn loop_download(outfile: &str) -> Result<(), Box<dyn std::error::Error>> {
