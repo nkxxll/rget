@@ -1,6 +1,6 @@
+pub mod structures;
 use std::fs::File;
 use std::io::BufWriter;
-use std::ops::Sub;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
