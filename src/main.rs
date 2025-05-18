@@ -2,6 +2,7 @@ pub mod structures;
 use core::hash;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::fmt::format;
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::BufWriter;
@@ -82,15 +83,31 @@ impl ContentType {
             Some(value) => {
                 match value.to_str() {
                     Ok(ct_str) => match ct_str {
-                        "text/plain" => ContentType::Text(TextType::Plain),
-                        "text/html" => ContentType::Text(TextType::Html),
-                        "text/css" => ContentType::Text(TextType::Css),
-                        "text/javascript" => ContentType::Text(TextType::Javascript),
-                        "text/xml" => ContentType::Text(TextType::Xml),
-                        "text/markdown" => ContentType::Text(TextType::Markdown),
-                        "text/csv" => ContentType::Text(TextType::Csv),
-                        "text/richtext" => ContentType::Text(TextType::Richtext),
-                        "text/tab-separated-values" => {
+                        ct_str if ct_str.starts_with("text/plain") => {
+                            ContentType::Text(TextType::Plain)
+                        }
+                        ct_str if ct_str.starts_with("text/html") => {
+                            ContentType::Text(TextType::Html)
+                        }
+                        ct_str if ct_str.starts_with("text/css") => {
+                            ContentType::Text(TextType::Css)
+                        }
+                        ct_str if ct_str.starts_with("text/javascript") => {
+                            ContentType::Text(TextType::Javascript)
+                        }
+                        ct_str if ct_str.starts_with("text/xml") => {
+                            ContentType::Text(TextType::Xml)
+                        }
+                        ct_str if ct_str.starts_with("text/markdown") => {
+                            ContentType::Text(TextType::Markdown)
+                        }
+                        ct_str if ct_str.starts_with("text/csv") => {
+                            ContentType::Text(TextType::Csv)
+                        }
+                        ct_str if ct_str.starts_with("text/richtext") => {
+                            ContentType::Text(TextType::Richtext)
+                        }
+                        ct_str if ct_str.starts_with("text/tab-separated-values") => {
                             ContentType::Text(TextType::TabSeparatedValues)
                         }
                         other => ContentType::Other(other.to_string()), // Store the unknown type
@@ -219,18 +236,24 @@ async fn get_urls(root_url: String, max_depth: usize) -> Tree<String> {
     let mut cur_width = 1;
     let mut next_width = 1;
     let mut cur_count = 1;
-    let mut cur_depth = 0;
     let mut q: Queue<TreeNodeRef<String>> = Queue::default();
     let root = TreeNode::new(root_url);
-    let url_tree: Tree<String> = Tree::new(root);
+    let mut url_tree: Tree<String> = Tree::new(root);
     q.push(url_tree.root.clone());
-    while !q.is_empty() && max_depth < cur_depth {
-        println!("info {cur_count}, {next_width}, {cur_depth}, {cur_width}");
+    dbg!(format!(
+        "queue is empty: {} and max_depth < cur_depth {}",
+        q.is_empty(),
+        max_depth <= url_tree.depth
+    ));
+    while !q.is_empty() && max_depth > url_tree.depth {
+        dbg!("info", cur_count, next_width, url_tree.depth, cur_width);
         if let Some(cur) = q.pop() {
-            let cur_clone = cur.clone();
-            let current = cur_clone.borrow();
-            let current_url = current.value.clone();
             cur_count += 1;
+            let cur_clone = cur.clone();
+            let current_url = {
+                let current = cur_clone.borrow();
+                current.value.clone()
+            };
             let res = reqwest::get(current_url)
                 .await
                 .unwrap()
@@ -244,6 +267,7 @@ async fn get_urls(root_url: String, max_depth: usize) -> Tree<String> {
                     next_width += &nodes.len();
 
                     for node in nodes {
+                        dbg!("adding node", &node);
                         let tree_node = TreeNode::new(node);
                         let tree_node_ref = Rc::new(RefCell::new(tree_node));
                         let clone = tree_node_ref.clone();
@@ -251,14 +275,17 @@ async fn get_urls(root_url: String, max_depth: usize) -> Tree<String> {
                         Tree::push_node(cur.clone(), clone);
                     }
                     if cur_width <= cur_count {
-                        cur_depth += 1;
                         cur_width = next_width;
                         next_width = 0;
                         cur_count = 0;
+                        url_tree.depth += 1;
                     }
                 }
                 ContentType::Other(string) => {
-                    println!("other content type: {string} stopping at depth {cur_depth}");
+                    println!(
+                        "other content type: {string} stopping at depth {0}",
+                        url_tree.depth
+                    );
                     continue;
                 }
                 _ => unreachable!("the header should work"),
@@ -279,7 +306,7 @@ fn find_https_links_with_parser(html_content: &str) -> Vec<String> {
     for element in document.select(&href_selector) {
         // Check for the 'href' attribute first
         if let Some(href) = element.attr("href") {
-            if href.starts_with("https://") {
+            if href.starts_with("https://") || href.starts_with("http://") {
                 https_urls.push(href.to_string());
             }
         }
@@ -297,6 +324,7 @@ fn find_https_links_with_parser(html_content: &str) -> Vec<String> {
 
 async fn download_depth(url: &str, depth: usize) -> Result<(), Box<dyn std::error::Error>> {
     let t: Tree<String> = get_urls(url.to_string(), depth).await;
+    dbg!("tree", &t);
     // this is a piece of very ugly code don't know how to fix it yet
     t.traverse_async(|url: &String| {
         let clone = url.clone();
