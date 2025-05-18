@@ -1,13 +1,15 @@
 pub mod structures;
+use core::hash;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::BufWriter;
 use std::ops::Sub;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self};
 use std::time::Duration;
 use std::{io::Write, sync::atomic::AtomicBool};
@@ -18,6 +20,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use reqwest::Response;
 use scraper::{Html, Selector};
+use structures::{Queue, Tree, TreeNode, TreeNodeRef};
 
 const OUT_FILE: &str = "rget.out";
 const DEFAULT_DEPTH: usize = 1;
@@ -191,38 +194,6 @@ struct Node {
     children: Vec<Self>,
 }
 
-struct Tree<'a> {
-    head: &'a Node,
-    depth: usize,
-}
-
-impl<'a> Tree<'a> {
-    fn new(h: &'a Node) -> Self {
-        Tree { head: h, depth: 1 }
-    }
-}
-
-impl Node {
-    fn new(value: String) -> Self {
-        Node {
-            value,
-            children: Vec::new(),
-        }
-    }
-    async fn traverse(&self) {
-        let mut q = VecDeque::new();
-        q.push_back(self);
-
-        while !q.is_empty() {
-            let n = q.pop_front().unwrap();
-            let value = &n.value;
-            let hash = hash_file_name(value.clone());
-            download(value, &hash).await.unwrap();
-            n.children.iter().for_each(|node| q.push_back(node));
-        }
-    }
-}
-
 fn hash_file_name(s: String) -> String {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
@@ -244,46 +215,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn get_urls(n: Rc<Mutex<Node>>, max_depth: usize) {
+async fn get_urls(root_url: String, max_depth: usize) -> Tree<String> {
     let mut cur_width = 1;
     let mut next_width = 1;
     let mut cur_count = 1;
     let mut cur_depth = 0;
-    let mut q = VecDeque::new();
-    q.push_back(n);
+    let mut q: Queue<TreeNodeRef<String>> = Queue::default();
+    let root = TreeNode::new(root_url);
+    let url_tree: Tree<String> = Tree::new(root);
+    q.push(url_tree.root.clone());
     while !q.is_empty() && max_depth < cur_depth {
-        let current = q.pop_front().unwrap();
-        cur_count += 1;
-        let res = reqwest::get(current.lock().unwrap().value.clone())
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
-        let content_type = ContentType::from_header_value(res.headers().get(CONTENT_TYPE));
-        match content_type {
-            ContentType::Text(_) => {
-                let site = res.text().await.unwrap();
-                let nodes = find_https_links_with_parser(&site);
-                current.lock().unwrap().children = nodes.iter().map(|x| Node::new(x.to_string())).collect();
-                for node in current.lock().unwrap().children.clone() {
-                    let push = Rc::new(Mutex::new(node));
-                    q.push_back(push);
+        println!("info {cur_count}, {next_width}, {cur_depth}, {cur_width}");
+        if let Some(cur) = q.pop() {
+            let cur_clone = cur.clone();
+            let current = cur_clone.borrow();
+            let current_url = current.value.clone();
+            cur_count += 1;
+            let res = reqwest::get(current_url)
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let content_type = ContentType::from_header_value(res.headers().get(CONTENT_TYPE));
+            match content_type {
+                ContentType::Text(_) => {
+                    let site = res.text().await.unwrap();
+                    let nodes = find_https_links_with_parser(&site);
+                    next_width += &nodes.len();
+
+                    for node in nodes {
+                        let tree_node = TreeNode::new(node);
+                        let tree_node_ref = Rc::new(RefCell::new(tree_node));
+                        let clone = tree_node_ref.clone();
+                        q.push(tree_node_ref);
+                        Tree::push_node(cur.clone(), clone);
+                    }
+                    if cur_width <= cur_count {
+                        cur_depth += 1;
+                        cur_width = next_width;
+                        next_width = 0;
+                        cur_count = 0;
+                    }
                 }
-                next_width += current.lock().unwrap().children.len();
-                if cur_width <= cur_count {
-                    cur_depth += 1;
-                    cur_width = next_width;
-                    next_width = 0;
-                    cur_count = 0;
+                ContentType::Other(string) => {
+                    println!("other content type: {string} stopping at depth {cur_depth}");
+                    continue;
                 }
+                _ => unreachable!("the header should work"),
             }
-            ContentType::Other(string) => {
-                println!("other content type: {string} stopping at depth {cur_depth}");
-                continue;
-            }
-            _ => unreachable!("the header should work"),
         }
     }
+    url_tree
 }
 
 fn find_https_links_with_parser(html_content: &str) -> Vec<String> {
@@ -314,12 +296,16 @@ fn find_https_links_with_parser(html_content: &str) -> Vec<String> {
 }
 
 async fn download_depth(url: &str, depth: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let head = Node::new(url.to_string());
-    let rc_head = Rc::new(Mutex::new(head));
-    let rc_headc = Rc::clone(&rc_head);
-    get_urls(rc_head, depth).await;
-    dbg!(&rc_headc);
-    rc_headc.lock().unwrap().traverse().await;
+    let t: Tree<String> = get_urls(url.to_string(), depth).await;
+    // this is a piece of very ugly code don't know how to fix it yet
+    t.traverse_async(|url: &String| {
+        let clone = url.clone();
+        let outfile = hash_file_name(url.to_string());
+        async move {
+            download(&clone, &outfile).await.unwrap();
+        }
+    })
+    .await;
     Ok(())
 }
 

@@ -1,28 +1,28 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, future::Future, pin::Pin, rc::Rc};
 
 type QueueNodeRef<T> = Rc<RefCell<QueueNode<T>>>;
 type OptQueueNodeRef<T> = Option<QueueNodeRef<T>>;
 
-type TreeNodeRef<T> = Rc<RefCell<TreeNode<T>>>;
+pub type TreeNodeRef<T> = Rc<RefCell<TreeNode<T>>>;
 type OptTreeNodeRef<T> = Option<TreeNodeRef<T>>;
 type TraverseFunction<T> = fn(&T);
 
 #[derive(Debug, Default)]
-struct TreeNode<T: Default> {
-    value: T,
-    children: Vec<TreeNodeRef<T>>,
+pub struct TreeNode<T: Default> {
+    pub value: T,
+    pub children: Vec<TreeNodeRef<T>>,
 }
 
 #[derive(Debug, Default)]
 pub struct Tree<T: Default> {
-    root: TreeNodeRef<T>,
+    pub root: TreeNodeRef<T>,
     pub depth: usize,
 }
 
 #[derive(Debug, Default)]
 struct QueueNode<T: Default> {
-    value: T,
-    next: OptQueueNodeRef<T>,
+    pub value: T,
+    pub next: OptQueueNodeRef<T>,
 }
 
 #[derive(Debug, Default)]
@@ -33,11 +33,34 @@ pub struct Queue<T: Default> {
 }
 
 impl<T: Default> Tree<T> {
-    fn push_node(parent: TreeNodeRef<T>, child: TreeNodeRef<T>) {
+    pub fn push_node(parent: TreeNodeRef<T>, child: TreeNodeRef<T>) {
         parent.borrow_mut().children.push(child);
     }
 
-    fn traverse<F>(&self, mut f: F)
+    pub async fn traverse_async<F, Fut>(&self, mut f: F)
+    where
+        F: FnMut(&T) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let mut q = Queue::default();
+        q.push(self.root.clone());
+
+        while !q.is_empty() {
+            if let Some(current) = q.pop() {
+                let borrowed = current.borrow();
+                let children = borrowed.children.clone();
+                let value = &borrowed.value;
+
+                for child in children {
+                    q.push(child);
+                }
+
+                f(value).await;
+            }
+        }
+    }
+
+    pub fn traverse<F>(&self, mut f: F)
     where
         F: FnMut(&T),
         T: Default,
@@ -57,8 +80,14 @@ impl<T: Default> Tree<T> {
         }
     }
 
-    fn new(root: TreeNode<T>) -> Self where T:Default {
-        Self { root: Rc::new(RefCell::new(root)) , depth: 1 }
+    pub fn new(root: TreeNode<T>) -> Self
+    where
+        T: Default,
+    {
+        Self {
+            root: Rc::new(RefCell::new(root)),
+            depth: 1,
+        }
     }
 }
 
@@ -210,7 +239,6 @@ mod test {
         let refc8 = Rc::new(RefCell::new(TreeNode::new(8)));
         let refc9 = Rc::new(RefCell::new(TreeNode::new(9)));
 
-
         Tree::push_node(t.root.clone(), refc1.clone());
         Tree::push_node(refc1.clone(), refc2.clone());
         Tree::push_node(refc1.clone(), refc3);
@@ -221,9 +249,10 @@ mod test {
         Tree::push_node(refc5, refc8.clone());
         Tree::push_node(refc8, refc9);
 
-        let mut nodes: Vec<usize> = Vec::new();
+        let nodes = Rc::new(RefCell::new(Vec::new()));
+        let clone = nodes.clone();
 
-        t.traverse(move |n| nodes.push(*n));
-        assert_eq!(nodes, )
+        t.traverse(move |n| clone.borrow_mut().push(*n));
+        assert_eq!(nodes.take(), vec![10, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 }
