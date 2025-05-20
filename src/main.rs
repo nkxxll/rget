@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{io::Write, sync::atomic::AtomicBool};
 
 use clap::{Parser, Subcommand};
@@ -22,6 +22,7 @@ use reqwest::Client;
 use reqwest::Response;
 use scraper::{Html, Selector};
 use structures::{Queue, Tree, TreeNode, TreeNodeRef};
+use tokio::task;
 
 const OUT_FILE: &str = "rget.out";
 const DEFAULT_DEPTH: usize = 1;
@@ -324,14 +325,12 @@ fn find_https_links_with_parser(html_content: &str) -> Vec<String> {
 
 async fn download_depth(url: &str, depth: usize) -> Result<(), Box<dyn std::error::Error>> {
     let t: Tree<String> = get_urls(url.to_string(), depth).await;
-    dbg!("tree", &t);
+    // dbg!("tree", &t);
     // this is a piece of very ugly code don't know how to fix it yet
-    t.traverse_async(|url: &String| {
+    t.traverse_async(async |url: String| {
         let clone = url.clone();
         let outfile = hash_file_name(url.to_string());
-        async move {
-            download(&clone, &outfile).await.unwrap();
-        }
+        download(&clone, &outfile).await.unwrap();
     })
     .await;
     Ok(())

@@ -1,4 +1,6 @@
-use std::{cell::RefCell, future::Future, pin::Pin, rc::Rc};
+use std::{cell::RefCell, future::Future, rc::Rc};
+
+use tokio::task;
 
 type QueueNodeRef<T> = Rc<RefCell<QueueNode<T>>>;
 type OptQueueNodeRef<T> = Option<QueueNodeRef<T>>;
@@ -7,14 +9,14 @@ pub type TreeNodeRef<T> = Rc<RefCell<TreeNode<T>>>;
 type OptTreeNodeRef<T> = Option<TreeNodeRef<T>>;
 type TraverseFunction<T> = fn(&T);
 
-#[derive(Debug, Default)]
-pub struct TreeNode<T: Default> {
+#[derive(Debug, Default, Clone)]
+pub struct TreeNode<T: Default + Clone> {
     pub value: T,
     pub children: Vec<TreeNodeRef<T>>,
 }
 
-#[derive(Debug, Default)]
-pub struct Tree<T: Default> {
+#[derive(Debug, Default, Clone)]
+pub struct Tree<T: Default + Clone> {
     pub root: TreeNodeRef<T>,
     pub depth: usize,
 }
@@ -25,38 +27,43 @@ struct QueueNode<T: Default> {
     pub next: OptQueueNodeRef<T>,
 }
 
-#[derive(Debug, Default)]
-pub struct Queue<T: Default> {
+#[derive(Debug, Default, Clone)]
+pub struct Queue<T: Default + Clone> {
     head: OptQueueNodeRef<T>,
     tail: OptQueueNodeRef<T>,
     pub length: usize,
 }
 
-impl<T: Default> Tree<T> {
+impl<T: Default + Clone> Tree<T> {
     pub fn push_node(parent: TreeNodeRef<T>, child: TreeNodeRef<T>) {
         parent.borrow_mut().children.push(child);
     }
 
     pub async fn traverse_async<F, Fut>(&self, mut f: F)
     where
-        F: FnMut(&T) -> Fut,
-        Fut: Future<Output = ()>,
+        T: Send + 'static,
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static
     {
         let mut q = Queue::default();
         q.push(self.root.clone());
+        // handles
+        let mut h = vec![];
 
         while !q.is_empty() {
             if let Some(current) = q.pop() {
-                let borrowed = current.borrow();
-                let children = borrowed.children.clone();
-                let value = &borrowed.value;
+                let b = current.borrow().clone();
+                let value = b.value;
+                let children = b.children;
 
                 for child in children {
                     q.push(child);
                 }
-
-                f(value).await;
+                h.push(task::spawn(f(value)));
             }
+        }
+        for handle in h {
+            handle.await.unwrap();
         }
     }
 
@@ -91,7 +98,7 @@ impl<T: Default> Tree<T> {
     }
 }
 
-impl<T: Default> TreeNode<T> {
+impl<T: Default + Clone> TreeNode<T> {
     pub fn new(value: T) -> Self {
         Self {
             value,
@@ -100,7 +107,7 @@ impl<T: Default> TreeNode<T> {
     }
 }
 
-impl<T: Default> Queue<T> {
+impl<T: Default + Clone> Queue<T> {
     pub fn push(&mut self, value: T)
     where
         T: Default,
